@@ -1,0 +1,76 @@
+Here are the steps as of the date of this comment that served to get ipvs-lc working for us, with our EKS managed node groups. Also, not sure it matters, but I used eksctl to provision my clusters initially. I am also using arm (Graviton 2) instances, with the default AMI.
+
+Step 1 : Create a new launch template version with user data to install ipvs dependencies
+In the eks console, click your cluster name, then click the Compute tab, click your nodegroup name (nodegroup-1 for me)->click the launch template name under "launch template" e.g. your-cluster-name-nodegroup-nodegroup-1) - then modify it (click actions -> modify template (create a new version)). Keep everything that is in the template already except for adding a description e.g. "install ipvs-lc dependencies", and adding the following to the "user data" section (under Advanced options) - note that since this is for managed node groups, the user data has to be in MIME format, as below (this tripped me up for a few)!
+
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
+
+--==MYBOUNDARY==
+Content-Type: text/x-shellscript; charset="us-ascii"
+
+#!/bin/bash
+yum install -y ipvsadm
+ipvsadm -l
+modprobe ip_vs 
+modprobe ip_vs_rr
+modprobe ip_vs_wrr 
+modprobe ip_vs_sh
+modprobe ip_vs_lc
+modprobe nf_conntrack
+
+--==MYBOUNDARY==--
+Step 2: Apply the new launch template
+Back in the eks console, (go to aws eks->click cluster name->click Compute tab) - you'll now see (if you couldn't before) under Node Groups that you can click "change version" next to the launch template name. Click to change the version to the version you just created and choose the default "rolling update" to apply the new launch template version in a no-downtime fashion. It takes a bit... maybe 10 min or so? Depends on the number of nodes. You can continually run kubectl get nodes in the cli to watch for progress.
+
+Step 3: Edit kube-proxy-config configmap
+When the above is finished, run:
+kubectl -n kube-system edit cm kube-proxy-config
+Do the following:
+
+change mode from iptables to ipvs
+change scheduler from "" to "lc"
+Step 4: Apply new kube-proxy parameters by editing the daemonset for kube-proxy
+Run:
+
+kubectl -n kube-system edit ds kube-proxy
+
+==> Change from
+      containers:
+      - command:
+        - kube-proxy
+        - --v=2
+        - --config=/var/lib/kube-proxy-config/config
+
+==> To
+      containers:
+      - command:
+        - kube-proxy
+        - --v=2
+        - --proxy-mode=ipvs
+        - --ipvs-scheduler=lc
+        - --config=/var/lib/kube-proxy-config/config
+        env:
+        - name: KUBE_PROXY_MODE
+          value: ipvs
+Step 5: Verify it's working
+Ssh to one of the worker nodes (click through to an ec2 instance via one of your nodes in the nodegroup you just updated, get the ip address, and ssh ec2-user@the-nodes-ip-address) and once connected, run command:
+
+$ sudo ipvsadm -l
+
+Output should look like:
+
+IP Virtual Server version 1.2.1 (size=4096)
+Prot LocalAddress:Port Scheduler Flags
+  -> RemoteAddress:Port           Forward Weight ActiveConn InActConn
+TCP  ip-172-2-0-10.us-east-2.com lc
+  -> ip-10-2-2-4.us-east-2.com Masq    1      0          0         
+  -> ip-10-8-9-0.us-east-2.comp Masq    1      0          0         
+TCP  ip-172-2-32-23.us-east-2.c lc
+  -> ip-10-1-2-3.us-east-2.comp Masq    1      0          0         
+  -> ip-10-5-6-7.us-east-2.com Masq    1      0          0         
+TCP  ip-172-20-6-7.us-east-2.co lc
+  -> ip-10-8-7-6.us-east-2.com Masq    1      0          0         
+  -> ip-10-8-6-5.us-east-2.comp Masq    1      0          0     
+
+...
